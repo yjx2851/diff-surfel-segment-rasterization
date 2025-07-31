@@ -153,14 +153,17 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
+	const float* __restrict__ segments,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixsegs,
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dtransMat,
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dsegment,
 	float* __restrict__ dL_dcolors)
 {
 	// We rasterize again. Compute necessary block info.
@@ -184,6 +187,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_segments[BLOCK_SIZE];
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
@@ -201,6 +205,7 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
+	float dL_dpixseg = 0;
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -239,6 +244,7 @@ renderCUDA(
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 	}
+	dL_dpixseg = dL_dpixsegs[pix_id];
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
@@ -267,6 +273,8 @@ renderCUDA(
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 				// collected_depths[block.thread_rank()] = depths[coll_id];
+
+			collected_segments[block.thread_rank()] = segments[coll_id];
 		}
 		block.sync();
 
@@ -338,6 +346,18 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+
+			//Propagate gradients to per-Gaussian segments
+			const float e = collected_segments[j];
+			float accum_ree = 0, last_segment=0;
+			accum_ree = last_alpha * last_segment + (1.f - last_segment) * accum_ree;
+			last_segment = e;
+			const float dL_dextrach = dL_dpixseg;
+			dL_dalpha += (e - accum_ree) * dL_dextrach;
+			atomicAdd(&(dL_dsegment[global_id]), dchannel_dcolor * dL_dextrach);
+
+			// const float dL_dpixsegchannel=dL_dpixseg;
+			// atomicAdd(&(dL_dsegment[global_id]), dchannel_dcolor * dL_dpixsegchannel);
 
 			float dL_dz = 0.0f;
 			float dL_dweight = 0;
@@ -698,16 +718,19 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* normal_opacity,
 	const float* colors,
+	const float* segments,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixseg,
 	const float* dL_depths,
 	float * dL_dtransMat,
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
+	float* dL_dsegment,
 	float* dL_dcolors)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -721,14 +744,17 @@ void BACKWARD::render(
 		transMats,
 		colors,
 		depths,
+		segments,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dpixseg,
 		dL_depths,
 		dL_dtransMat,
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
+		dL_dsegment,
 		dL_dcolors
 		);
 }

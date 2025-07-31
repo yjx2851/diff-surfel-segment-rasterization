@@ -27,6 +27,7 @@ namespace FORWARD
 		const float scale_modifier,
 		const glm::vec4* rotations,
 		const float* opacities,
+		const float* segments,
 		const float* shs,
 		bool* clamped,
 		const float* transMat_precomp,
@@ -45,6 +46,7 @@ namespace FORWARD
 		float* transMats,
 		float* colors,
 		float4* normal_opacity,
+		float* segment2D,
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered);
@@ -61,10 +63,12 @@ namespace FORWARD
 		const float* transMats,
 		const float* depths,
 		const float4* normal_opacity,
+		const float* segment2D,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
+		float* out_segment,
 		float* out_others);
 }
 

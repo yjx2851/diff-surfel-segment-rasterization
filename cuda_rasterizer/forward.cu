@@ -152,6 +152,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* segments,
 	const float* shs,
 	bool* clamped,
 	const float* transMat_precomp,
@@ -168,6 +169,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
+	float* segment2D,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -247,12 +249,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
+	// Compute segment2D
+	segment2D[idx] = segments[idx];
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
+
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -265,10 +270,12 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
+	const float* __restrict__ segment2D,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
+	float* __restrict__ out_segment,
 	float* __restrict__ out_others)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -294,6 +301,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
+	__shared__ float collected_segment2D[BLOCK_SIZE];
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
@@ -303,6 +311,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float accum_segment = 0.0f;
 
 
 #if RENDER_AXUTILITY
@@ -311,6 +320,7 @@ renderCUDA(
 	float D = { 0 };
 	float M1 = {0};
 	float M2 = {0};
+	// TODO segment output
 	float distortion = {0};
 	float median_depth = {0};
 	// float median_weight = {0};
@@ -334,6 +344,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_normal_opacity[block.thread_rank()] = normal_opacity[coll_id];
+			collected_segment2D[block.thread_rank()] = segment2D[coll_id];
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
@@ -416,6 +427,8 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+			// Update segment2D
+			accum_segment += segment2D[collected_id[j]]*w;
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -432,6 +445,8 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		out_segment[pix_id ]=accum_segment;
+
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
@@ -458,10 +473,12 @@ void FORWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
+	const float* segment2D,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
+	float* out_segment,
 	float* out_others)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
@@ -474,10 +491,12 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
+		segment2D,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
+		out_segment,
 		out_others);
 }
 
@@ -487,6 +506,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* segments,
 	const float* shs,
 	bool* clamped,
 	const float* transMat_precomp,
@@ -503,6 +523,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
+	float* segment2D,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -514,6 +535,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
+		segments,
 		shs,
 		clamped,
 		transMat_precomp,
@@ -530,6 +552,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		transMats,
 		rgb,
 		normal_opacity,
+		segment2D,
 		grid,
 		tiles_touched,
 		prefiltered

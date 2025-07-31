@@ -154,6 +154,7 @@ void CudaRasterizer::Rasterizer::markVisible(
 
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
+	
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
@@ -161,25 +162,31 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.transMat, P * 9, 128);
 	obtain(chunk, geom.normal_opacity, P, 128);
+	obtain(chunk, geom.segment2D, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
+	
+	
 	return geom;
 }
 
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
+
 	ImageState img;
 	obtain(chunk, img.accum_alpha, N * 3, 128);
 	obtain(chunk, img.n_contrib, N * 2, 128);
 	obtain(chunk, img.ranges, N, 128);
+	
 	return img;
 }
 
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
 {
+	
 	BinningState binning;
 	obtain(chunk, binning.point_list, P, 128);
 	obtain(chunk, binning.point_list_unsorted, P, 128);
@@ -190,6 +197,8 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
+	
+	
 	return binning;
 }
 
@@ -206,6 +215,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* opacities,
+	const float* segments,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -216,6 +226,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* out_segment,
 	float* out_others,
 	int* radii,
 	bool debug)
@@ -253,6 +264,7 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		segments,
 		shs,
 		geomState.clamped,
 		transMat_precomp,
@@ -268,6 +280,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.transMat,
 		geomState.rgb,
 		geomState.normal_opacity,
+		geomState.segment2D,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered
@@ -308,6 +321,7 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 
+
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
@@ -332,10 +346,13 @@ int CudaRasterizer::Rasterizer::forward(
 		transMat_ptr,
 		geomState.depths,
 		geomState.normal_opacity,
+		// check
+		geomState.segment2D,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
 		out_color,
+		out_segment,
 		out_others), debug)
 
 	return num_rendered;
@@ -353,6 +370,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
+	const float* segments,
 	const float* transMat_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -363,10 +381,12 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,
 	char* img_buffer,
 	const float* dL_dpix,
+	const float* dL_dpixseg,
 	const float* dL_depths,
 	float* dL_dmean2D,
 	float* dL_dnormal,
 	float* dL_dopacity,
+	float* dL_dsegment,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dtransMat,
@@ -378,6 +398,7 @@ void CudaRasterizer::Rasterizer::backward(
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+
 
 	if (radii == nullptr)
 	{
@@ -396,6 +417,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	const float* depth_ptr = geomState.depths;
 	const float* transMat_ptr = (transMat_precomp != nullptr) ? transMat_precomp : geomState.transMat;
+	
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -407,16 +429,19 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.means2D,
 		geomState.normal_opacity,
 		color_ptr,
+		segments,
 		transMat_ptr,
 		depth_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		dL_dpixseg,
 		dL_depths,
 		dL_dtransMat,
 		(float3*)dL_dmean2D,
 		dL_dnormal,
 		dL_dopacity,
+		dL_dsegment,
 		dL_dcolor), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
