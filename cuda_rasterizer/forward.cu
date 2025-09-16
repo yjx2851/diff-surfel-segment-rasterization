@@ -15,6 +15,8 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#define MAX_FEATURE_DEGREE 16 // Maximum feature dimension supported
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
@@ -271,11 +273,14 @@ renderCUDA(
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
 	const float* __restrict__ segment2D,
+	const float* __restrict__ extra_features2D,
+	const int feature_degree,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_segment,
+	float* __restrict__ out_extra_features,
 	float* __restrict__ out_others)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -312,6 +317,7 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float accum_segment = 0.0f;
+	float accum_extra_features[MAX_FEATURE_DEGREE] = { 0.0f };
 
 
 #if RENDER_AXUTILITY
@@ -429,6 +435,10 @@ renderCUDA(
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
 			// Update segment2D
 			accum_segment += segment2D[collected_id[j]]*w;
+			// Update extra_features2D
+			for (int ch = 0; ch < feature_degree; ch++) {
+				accum_extra_features[ch] += extra_features2D[collected_id[j] * feature_degree + ch] * w;
+			}
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -445,7 +455,10 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
-		out_segment[pix_id ]=accum_segment;
+		out_segment[pix_id] = accum_segment;
+		for (int ch = 0; ch < feature_degree; ch++) {
+			out_extra_features[ch * H * W + pix_id] = accum_extra_features[ch];
+		}
 
 
 #if RENDER_AXUTILITY
@@ -474,11 +487,14 @@ void FORWARD::render(
 	const float* depths,
 	const float4* normal_opacity,
 	const float* segment2D,
+	const float* extra_features2D,
+	const int feature_degree,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
 	float* out_segment,
+	float* out_extra_features,
 	float* out_others)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
@@ -492,11 +508,14 @@ void FORWARD::render(
 		depths,
 		normal_opacity,
 		segment2D,
+		extra_features2D,
+		feature_degree,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
 		out_segment,
+		out_extra_features,
 		out_others);
 }
 
@@ -556,5 +575,5 @@ void FORWARD::preprocess(int P, int D, int M,
 		grid,
 		tiles_touched,
 		prefiltered
-		);
+	);
 }

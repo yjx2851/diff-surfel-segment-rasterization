@@ -15,6 +15,8 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#define MAX_FEATURE_DEGREE 16 // Maximum feature dimension supported
+
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
@@ -154,16 +156,20 @@ renderCUDA(
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ segments,
+	const float* __restrict__ extra_features,
+	const int feature_degree,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixsegs,
+	const float* __restrict__ dL_dpix_extra_features,
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dtransMat,
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dsegment,
+	float* __restrict__ dL_dextra_features,
 	float* __restrict__ dL_dcolors)
 {
 	// We rasterize again. Compute necessary block info.
@@ -188,6 +194,7 @@ renderCUDA(
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_segments[BLOCK_SIZE];
+	__shared__ float collected_extra_features[MAX_FEATURE_DEGREE * BLOCK_SIZE];
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
@@ -206,6 +213,7 @@ renderCUDA(
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
 	float dL_dpixseg = 0;
+	float dL_dpix_extra_feature[MAX_FEATURE_DEGREE] = { 0 };
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -224,6 +232,8 @@ renderCUDA(
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		for (int ch = 0; ch<feature_degree; ch++)
+			dL_dpix_extra_feature[ch] = dL_dpix_extra_features[ch * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 	}
 
@@ -233,6 +243,7 @@ renderCUDA(
 	float accum_depth_rec = 0;
 	float accum_alpha_rec = 0;
 	float accum_normal_rec[3] = {0};
+	float accum_extra[MAX_FEATURE_DEGREE] = { 0 };
 	// for compute gradient with respect to the distortion map
 	const float final_D = inside ? final_Ts[pix_id + H * W] : 0;
 	const float final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
@@ -248,6 +259,7 @@ renderCUDA(
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_extra_feature[MAX_FEATURE_DEGREE] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -270,11 +282,14 @@ renderCUDA(
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
-			for (int i = 0; i < C; i++)
-				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int ch = 0; ch < C; ch++)
+				collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + ch];
 				// collected_depths[block.thread_rank()] = depths[coll_id];
 
 			collected_segments[block.thread_rank()] = segments[coll_id];
+			for (int ch = 0; ch < feature_degree; ch++) {
+				collected_extra_features[ch * BLOCK_SIZE + block.thread_rank()] = extra_features[coll_id * feature_degree + ch];
+			}
 		}
 		block.sync();
 
@@ -356,6 +371,17 @@ renderCUDA(
 			dL_dalpha += (e - accum_ree) * dL_dextrach;
 			atomicAdd(&(dL_dsegment[global_id]), dchannel_dcolor * dL_dextrach);
 
+			//Propagate gradients to per-Gaussian extra_features
+			for (int ch = 0; ch < feature_degree; ch++) {
+				const float ef = collected_extra_features[ch * BLOCK_SIZE + j];
+				// Use the gradient for the specific feature dimension
+				accum_extra[ch] = last_alpha * last_extra_feature[ch] + (1.f - last_alpha) * accum_extra[ch];
+				last_extra_feature[ch] = ef;
+				const float dL_dextra_feature = dL_dpix_extra_feature[ch];
+				dL_dalpha += (ef - accum_extra[ch]) * dL_dextra_feature;
+				atomicAdd(&(dL_dextra_features[global_id * feature_degree + ch]), dchannel_dcolor * dL_dextra_feature);
+			}
+
 			// const float dL_dpixsegchannel=dL_dpixseg;
 			// atomicAdd(&(dL_dsegment[global_id]), dchannel_dcolor * dL_dpixsegchannel);
 
@@ -405,8 +431,8 @@ renderCUDA(
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
 			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+			for (int ch = 0; ch < C; ch++)
+				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
@@ -719,18 +745,22 @@ void BACKWARD::render(
 	const float4* normal_opacity,
 	const float* colors,
 	const float* segments,
+	const float* extra_features,
+	const int feature_degree,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixseg,
+	const float* dL_dpix_extra_features,
 	const float* dL_depths,
 	float * dL_dtransMat,
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dsegment,
+	float* dL_dextra_features,
 	float* dL_dcolors)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -745,16 +775,20 @@ void BACKWARD::render(
 		colors,
 		depths,
 		segments,
+		extra_features,
+		feature_degree,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
 		dL_dpixseg,
+		dL_dpix_extra_features,
 		dL_depths,
 		dL_dtransMat,
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
 		dL_dsegment,
+		dL_dextra_features,
 		dL_dcolors
 		);
 }

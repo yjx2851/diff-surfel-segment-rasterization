@@ -64,11 +64,14 @@ namespace FORWARD
 		const float* depths,
 		const float4* normal_opacity,
 		const float* segment2D,
+		const float* extra_features2D,
+		const int feature_degree,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
 		float* out_segment,
+		float* out_extra_features,
 		float* out_others);
 }
 

@@ -18,6 +18,8 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <cub/cub.cuh>
+
+#define MAX_FEATURE_DEGREE 16 // Maximum feature dimension supported
 #include <cub/device/device_radix_sort.cuh>
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
@@ -216,6 +218,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* colors_precomp,
 	const float* opacities,
 	const float* segments,
+	const float* extra_features,
+	const int feature_degree,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -227,6 +231,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* out_segment,
+	float* out_extra_features,
 	float* out_others,
 	int* radii,
 	bool debug)
@@ -348,11 +353,14 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.normal_opacity,
 		// check
 		geomState.segment2D,
+		extra_features,
+ 		feature_degree,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
 		out_color,
 		out_segment,
+		out_extra_features,
 		out_others), debug)
 
 	return num_rendered;
@@ -371,6 +379,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float scale_modifier,
 	const float* rotations,
 	const float* segments,
+	const float* extra_features,
+	const int feature_degree,
 	const float* transMat_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -382,11 +392,13 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	const float* dL_dpix,
 	const float* dL_dpixseg,
+	const float* dL_dpix_extra_features,
 	const float* dL_depths,
 	float* dL_dmean2D,
 	float* dL_dnormal,
 	float* dL_dopacity,
 	float* dL_dsegment,
+	float* dL_dextra_features,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dtransMat,
@@ -430,18 +442,22 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.normal_opacity,
 		color_ptr,
 		segments,
+		extra_features,
+		feature_degree,
 		transMat_ptr,
 		depth_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
 		dL_dpixseg,
+		dL_dpix_extra_features,
 		dL_depths,
 		dL_dtransMat,
 		(float3*)dL_dmean2D,
 		dL_dnormal,
 		dL_dopacity,
 		dL_dsegment,
+		dL_dextra_features,
 		dL_dcolor), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
